@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 
-const STORAGE_KEY = 'practice-log-studio.entries';
+const STORAGE_KEY = 'bagheera-study.entries';
 
 const emptyForm = () => ({
   date: new Date().toISOString().slice(0, 10),
@@ -140,7 +140,7 @@ function App() {
     <main className="page-shell">
       <section className="hero-panel">
         <div className="hero-copy">
-          <p className="eyebrow">Practice Log Studio</p>
+          <p className="eyebrow">Bagheera Study</p>
           <h1>Build momentum, one focused session at a time.</h1>
           <p className="hero-text">
             Log project work and LeetCode reps in one place so your effort
