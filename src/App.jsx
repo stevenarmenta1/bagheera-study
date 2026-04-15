@@ -1,6 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { hasSupabaseConfig, supabase } from './lib/supabase.js';
 
 const STORAGE_KEY = 'bagheera-study.entries';
+const LEGACY_STORAGE_KEY = 'practice-log-studio.entries';
 
 const emptyForm = () => ({
   date: new Date().toISOString().slice(0, 10),
@@ -10,9 +12,36 @@ const emptyForm = () => ({
   notes: '',
 });
 
-function readEntries() {
+function sortEntries(entries) {
+  return [...entries].sort((a, b) => {
+    if (a.date !== b.date) {
+      return b.date.localeCompare(a.date);
+    }
+
+    return (b.created_at ?? b.id).localeCompare(a.created_at ?? a.id);
+  });
+}
+
+function normalizeEntries(entries) {
+  return sortEntries(
+    entries
+      .filter((entry) => entry && typeof entry === 'object')
+      .map((entry) => ({
+        id: String(entry.id),
+        user_id: entry.user_id ? String(entry.user_id) : '',
+        date: String(entry.date ?? ''),
+        title: String(entry.title ?? ''),
+        type: entry.type === 'LeetCode' ? 'LeetCode' : 'Project',
+        minutes: Number(entry.minutes ?? 0),
+        notes: String(entry.notes ?? ''),
+        created_at: String(entry.created_at ?? entry.id ?? ''),
+      })),
+  );
+}
+
+function readStorageEntries(key) {
   try {
-    const stored = window.localStorage.getItem(STORAGE_KEY);
+    const stored = window.localStorage.getItem(key);
     if (!stored) {
       return [];
     }
@@ -24,29 +53,14 @@ function readEntries() {
   }
 }
 
-function sortEntries(entries) {
-  return [...entries].sort((a, b) => {
-    if (a.date !== b.date) {
-      return b.date.localeCompare(a.date);
-    }
-
-    return b.id.localeCompare(a.id);
-  });
+function getLocalEntriesForImport() {
+  const currentEntries = readStorageEntries(STORAGE_KEY);
+  const legacyEntries = readStorageEntries(LEGACY_STORAGE_KEY);
+  return normalizeEntries([...currentEntries, ...legacyEntries]);
 }
 
-function normalizeEntries(entries) {
-  return sortEntries(
-    entries
-      .filter((entry) => entry && typeof entry === 'object')
-      .map((entry) => ({
-        id: String(entry.id),
-        date: String(entry.date ?? ''),
-        title: String(entry.title ?? ''),
-        type: entry.type === 'LeetCode' ? 'LeetCode' : 'Project',
-        minutes: Number(entry.minutes ?? 0),
-        notes: String(entry.notes ?? ''),
-      })),
-  );
+function getImportMarker(userId) {
+  return `bagheera-study.imported.${userId}`;
 }
 
 function calculateStreak(entries) {
@@ -86,16 +100,159 @@ function formatDate(dateString) {
   });
 }
 
+function getProfile(session) {
+  const user = session?.user;
+  if (!user) {
+    return null;
+  }
+
+  return {
+    name: user.user_metadata?.full_name || user.user_metadata?.name || 'Bagheera learner',
+    email: user.email || '',
+  };
+}
+
+async function fetchEntries(userId) {
+  const { data, error } = await supabase
+    .from('practice_entries')
+    .select('id, user_id, date, title, type, minutes, notes, created_at')
+    .eq('user_id', userId)
+    .order('date', { ascending: false })
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    throw error;
+  }
+
+  return normalizeEntries(data ?? []);
+}
+
+async function maybeImportLocalEntries(userId) {
+  const marker = getImportMarker(userId);
+  if (window.localStorage.getItem(marker)) {
+    return;
+  }
+
+  const entries = getLocalEntriesForImport();
+  if (entries.length === 0) {
+    window.localStorage.setItem(marker, 'done');
+    return;
+  }
+
+  const payload = entries.map((entry) => ({
+    user_id: userId,
+    date: entry.date,
+    title: entry.title,
+    type: entry.type,
+    minutes: entry.minutes,
+    notes: entry.notes,
+  }));
+
+  const { error } = await supabase.from('practice_entries').insert(payload);
+  if (error) {
+    throw error;
+  }
+
+  window.localStorage.setItem(marker, 'done');
+}
+
 function App() {
-  const [entries, setEntries] = useState(() => normalizeEntries(readEntries()));
+  const [entries, setEntries] = useState([]);
   const [form, setForm] = useState(() => emptyForm());
+  const [session, setSession] = useState(null);
+  const [authState, setAuthState] = useState(hasSupabaseConfig ? 'loading' : 'missing-config');
+  const [isSaving, setIsSaving] = useState(false);
+  const [message, setMessage] = useState('');
 
   useEffect(() => {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
-  }, [entries]);
+    if (!hasSupabaseConfig) {
+      return undefined;
+    }
 
-  const totalMinutes = entries.reduce((sum, entry) => sum + entry.minutes, 0);
-  const streak = calculateStreak(entries);
+    let isActive = true;
+
+    async function loadSession() {
+      const {
+        data: { session: activeSession },
+        error,
+      } = await supabase.auth.getSession();
+
+      if (!isActive) {
+        return;
+      }
+
+      if (error) {
+        setMessage(error.message);
+      }
+
+      setSession(activeSession);
+      setAuthState(activeSession ? 'signed-in' : 'signed-out');
+    }
+
+    loadSession();
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      if (!isActive) {
+        return;
+      }
+
+      setSession(nextSession);
+      setEntries([]);
+      setAuthState(nextSession ? 'signed-in' : 'signed-out');
+    });
+
+    return () => {
+      isActive = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!session?.user?.id) {
+      return;
+    }
+
+    let isActive = true;
+
+    async function syncUserData() {
+      setMessage('');
+      setAuthState('loading');
+
+      try {
+        await maybeImportLocalEntries(session.user.id);
+        const nextEntries = await fetchEntries(session.user.id);
+        if (!isActive) {
+          return;
+        }
+
+        setEntries(nextEntries);
+        setAuthState('signed-in');
+      } catch (error) {
+        if (!isActive) {
+          return;
+        }
+
+        setEntries([]);
+        setAuthState('signed-in');
+        setMessage(error.message || 'Could not sync your practice entries yet.');
+      }
+    }
+
+    syncUserData();
+
+    return () => {
+      isActive = false;
+    };
+  }, [session?.user?.id]);
+
+  const totalMinutes = useMemo(
+    () => entries.reduce((sum, entry) => sum + entry.minutes, 0),
+    [entries],
+  );
+  const streak = useMemo(() => calculateStreak(entries), [entries]);
+  const profile = getProfile(session);
 
   function handleChange(event) {
     const { name, value } = event.target;
@@ -105,19 +262,28 @@ function App() {
     }));
   }
 
-  function handleSubmit(event) {
+  async function handleSubmit(event) {
     event.preventDefault();
+
+    if (!session?.user?.id) {
+      setMessage('Sign in before saving a practice session.');
+      return;
+    }
 
     const title = form.title.trim();
     const notes = form.notes.trim();
     const minutes = Number(form.minutes);
 
     if (!title || !form.date || !Number.isFinite(minutes) || minutes <= 0) {
+      setMessage('Fill out the date, title, and minutes before saving.');
       return;
     }
 
-    const nextEntry = {
-      id: `${Date.now()}`,
+    setIsSaving(true);
+    setMessage('');
+
+    const payload = {
+      user_id: session.user.id,
       date: form.date,
       title,
       type: form.type === 'LeetCode' ? 'LeetCode' : 'Project',
@@ -125,22 +291,150 @@ function App() {
       notes,
     };
 
-    setEntries((current) => sortEntries([nextEntry, ...current]));
+    const { data, error } = await supabase
+      .from('practice_entries')
+      .insert(payload)
+      .select('id, user_id, date, title, type, minutes, notes, created_at')
+      .single();
+
+    setIsSaving(false);
+
+    if (error) {
+      setMessage(error.message || 'Could not save your entry.');
+      return;
+    }
+
+    setEntries((current) => sortEntries([data, ...current]));
     setForm((current) => ({
       ...emptyForm(),
       date: current.date,
     }));
   }
 
-  function handleDelete(id) {
+  async function handleDelete(id) {
+    setMessage('');
+
+    const previousEntries = entries;
     setEntries((current) => current.filter((entry) => entry.id !== id));
+
+    const { error } = await supabase.from('practice_entries').delete().eq('id', id);
+    if (error) {
+      setEntries(previousEntries);
+      setMessage(error.message || 'Could not delete that entry.');
+    }
+  }
+
+  async function handleGoogleSignIn() {
+    if (!hasSupabaseConfig) {
+      return;
+    }
+
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        redirectTo: window.location.origin,
+      },
+    });
+
+    if (error) {
+      setMessage(error.message || 'Could not start Google sign-in.');
+    }
+  }
+
+  async function handleSignOut() {
+    const { error } = await supabase.auth.signOut();
+    if (error) {
+      setMessage(error.message || 'Could not sign out right now.');
+    } else {
+      setMessage('');
+    }
+  }
+
+  if (authState === 'missing-config') {
+    return (
+      <main className="page-shell">
+        <section className="setup-panel">
+          <p className="eyebrow">Bagheera Study</p>
+          <h1>Connect Supabase to turn this into a real multi-device app.</h1>
+          <p className="hero-text">
+            Add `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` to your local
+            `.env.local` file and to Vercel, then run the SQL in
+            `supabase/schema.sql`.
+          </p>
+          <div className="setup-list">
+            <span>1. Create a Supabase project</span>
+            <span>2. Enable Google auth in Supabase</span>
+            <span>3. Add the env vars from `.env.example`</span>
+            <span>4. Run the SQL schema file</span>
+          </div>
+        </section>
+      </main>
+    );
+  }
+
+  if (authState === 'loading') {
+    return (
+      <main className="page-shell">
+        <section className="setup-panel">
+          <p className="eyebrow">Bagheera Study</p>
+          <h1>Loading your study space...</h1>
+        </section>
+      </main>
+    );
+  }
+
+  if (authState === 'signed-out') {
+    return (
+      <main className="page-shell">
+        <section className="hero-panel auth-hero">
+          <div className="hero-copy">
+            <p className="eyebrow">Bagheera Study</p>
+            <h1>Keep your coding streak alive across every device.</h1>
+            <p className="hero-text">
+              Sign in with Google to save your project sessions and LeetCode
+              practice in the cloud, not just one browser.
+            </p>
+            <div className="landing-actions">
+              <button type="button" className="primary-button" onClick={handleGoogleSignIn}>
+                Continue with Google
+              </button>
+              <p className="subtle-copy">
+                Your entries stay private to your account.
+              </p>
+            </div>
+          </div>
+
+          <div className="hero-stats auth-cards">
+            <StatCard value="Cloud" label="Sync" accent="amber" />
+            <StatCard value="Private" label="Entries" accent="blue" />
+            <StatCard value="Google" label="Login" accent="coral" />
+          </div>
+        </section>
+
+        {message ? <p className="message-banner">{message}</p> : null}
+      </main>
+    );
   }
 
   return (
     <main className="page-shell">
+      <section className="topbar">
+        <div>
+          <p className="eyebrow">Bagheera Study</p>
+          <h2>{profile?.name}</h2>
+          <p className="subtle-copy">{profile?.email}</p>
+        </div>
+
+        <button type="button" className="ghost-button" onClick={handleSignOut}>
+          Sign out
+        </button>
+      </section>
+
+      {message ? <p className="message-banner">{message}</p> : null}
+
       <section className="hero-panel">
         <div className="hero-copy">
-          <p className="eyebrow">Bagheera Study</p>
+          <p className="eyebrow">Cloud practice log</p>
           <h1>Build momentum, one focused session at a time.</h1>
           <p className="hero-text">
             Log project work and LeetCode reps in one place so your effort
@@ -221,7 +515,9 @@ function App() {
               />
             </label>
 
-            <button type="submit">Save practice session</button>
+            <button type="submit" disabled={isSaving}>
+              {isSaving ? 'Saving...' : 'Save practice session'}
+            </button>
           </form>
         </section>
 
@@ -235,7 +531,8 @@ function App() {
             <div className="empty-state">
               <p>No sessions yet.</p>
               <span>
-                Your first log will show up here and start building your streak.
+                Your first cloud-saved log will show up here and follow you
+                across devices.
               </span>
             </div>
           ) : (
